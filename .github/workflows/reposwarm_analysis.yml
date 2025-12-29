@@ -1,0 +1,149 @@
+name: RepoSwarm Architecture Analysis
+
+on:
+  schedule:
+    # Run daily at 2am EST (7am UTC)
+    - cron: '0 7 * * *'
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      repo_name:
+        description: 'Specific repo to analyze (leave empty for all)'
+        required: false
+        type: string
+      force_analysis:
+        description: 'Force re-analysis (ignore cache)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: '3.12'
+  TARGET_REPO: 'breverdbidder/architecture-docs'
+
+jobs:
+  analyze-repositories:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Need write permission to commit to architecture-docs
+    
+    steps:
+      - name: Checkout RepoSwarm
+        uses: actions/checkout@v4
+        with:
+          repository: breverdbidder/repo-swarm
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: repo-swarm
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install Dependencies
+        run: |
+          # No dependencies needed - using pure Python + curl for Claude API
+          echo "✅ Python $PYTHON_VERSION ready"
+      
+      - name: Copy CLI and Configuration
+        run: |
+          # Copy simplified CLI
+          cp repo-swarm/reposwarm_cli.py ./
+          chmod +x reposwarm_cli.py
+          
+          # Create prompts directory structure
+          mkdir -p prompts/backend prompts/frontend prompts/infra-as-code prompts/shared
+          
+          # Copy repos.json
+          cp repo-swarm/prompts/repos.json ./prompts/ || echo "{}" > ./prompts/repos.json
+          
+          # Create output directory
+          mkdir -p temp
+      
+      - name: Run RepoSwarm Analysis
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          echo "🤖 Starting RepoSwarm analysis..."
+          python3 reposwarm_cli.py analyze-all \
+            --config prompts/repos.json \
+            --output-dir ./temp
+      
+      - name: Checkout Architecture Docs Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: architecture-docs
+      
+      - name: Copy Generated Files
+        run: |
+          # Copy all .arch.md files to architecture-docs repo
+          cp temp/*.arch.md architecture-docs/ 2>/dev/null || echo "No .arch.md files generated"
+          
+          # List generated files
+          echo "📄 Generated files:"
+          ls -lh architecture-docs/*.arch.md 2>/dev/null || echo "No files found"
+      
+      - name: Commit and Push
+        run: |
+          cd architecture-docs
+          
+          # Configure git
+          git config user.name "RepoSwarm Bot"
+          git config user.email "reposwarm@biddeed.ai"
+          
+          # Add all .arch.md files
+          git add *.arch.md
+          
+          # Check if there are changes
+          if git diff --staged --quiet; then
+            echo "✅ No changes to commit (all repos up-to-date)"
+          else
+            # Commit with timestamp
+            TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S UTC')
+            git commit -m "🤖 Auto-update architecture docs - ${TIMESTAMP}
+            
+            Analyzed repositories:
+            $(ls -1 *.arch.md | sed 's/.arch.md//' | sed 's/^/- /')
+            
+            Triggered by: ${{ github.event_name }}
+            Workflow run: ${{ github.run_id }}"
+            
+            # Push changes
+            git push
+            echo "✅ Architecture docs updated successfully"
+          fi
+      
+      - name: Upload Analysis Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reposwarm-analysis-${{ github.run_number }}
+          path: |
+            temp/*.arch.md
+          retention-days: 7
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 📊 RepoSwarm Analysis Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -d "temp" ]; then
+            ARCH_FILES=$(ls temp/*.arch.md 2>/dev/null | wc -l)
+            echo "✅ Generated **${ARCH_FILES}** architecture documentation files" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Generated Files:" >> $GITHUB_STEP_SUMMARY
+            for file in temp/*.arch.md; do
+              if [ -f "$file" ]; then
+                BASENAME=$(basename "$file")
+                SIZE=$(du -h "$file" | cut -f1)
+                echo "- \`${BASENAME}\` (${SIZE})" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          else
+            echo "❌ No architecture files generated" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "View architecture docs: [architecture-docs](https://github.com/${{ env.TARGET_REPO }})" >> $GITHUB_STEP_SUMMARY
